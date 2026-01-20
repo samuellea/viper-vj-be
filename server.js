@@ -5,6 +5,7 @@ const admin = require('firebase-admin');
 const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
+const bcrypt = require('bcrypt');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -84,6 +85,30 @@ try {
   process.exit(1);
 }
 
+// Helper functions to encode/decode usernames for Firebase paths
+// Firebase Realtime Database paths cannot contain: ".", "#", "$", "[", "]"
+function encodeUsernameForFirebase(username) {
+  if (!username) return username;
+  return username
+    .replace(/\./g, '_DOT_')
+    .replace(/@/g, '_AT_')
+    .replace(/#/g, '_HASH_')
+    .replace(/\$/g, '_DOLLAR_')
+    .replace(/\[/g, '_LBRACKET_')
+    .replace(/\]/g, '_RBRACKET_');
+}
+
+function decodeUsernameFromFirebase(encodedUsername) {
+  if (!encodedUsername) return encodedUsername;
+  return encodedUsername
+    .replace(/_DOT_/g, '.')
+    .replace(/_AT_/g, '@')
+    .replace(/_HASH_/g, '#')
+    .replace(/_DOLLAR_/g, '$')
+    .replace(/_LBRACKET_/g, '[')
+    .replace(/_RBRACKET_/g, ']');
+}
+
 // Helper function to fetch YouTube video title
 async function getYouTubeVideoTitle(videoId) {
   try {
@@ -103,7 +128,7 @@ app.post('/videos', async (req, res) => {
     console.log('POST /videos - Request received');
     console.log('Request body:', JSON.stringify(req.body, null, 2));
     
-    const { youtubeUrl, videoId, hotcues } = req.body;
+    const { youtubeUrl, videoId, hotcues, username } = req.body;
 
     // Validation
     if (!youtubeUrl || !videoId) {
@@ -116,6 +141,15 @@ app.post('/videos', async (req, res) => {
         error: 'Missing required fields',
         missingFields: missingFields,
         received: { youtubeUrl: !!youtubeUrl, videoId: !!videoId, hotcues: !!hotcues }
+      });
+    }
+
+    // Validate username
+    if (!username) {
+      console.error('Validation error: Missing username');
+      return res.status(400).json({ 
+        error: 'Missing required field: username',
+        details: 'Username is required to save videos'
       });
     }
 
@@ -133,24 +167,44 @@ app.post('/videos', async (req, res) => {
     const title = await getYouTubeVideoTitle(videoId);
     console.log('Video title:', title);
 
+    // Encode username for Firebase path (Firebase paths cannot contain ".", "#", "$", "[", "]")
+    const encodedUsername = encodeUsernameForFirebase(username);
+    
+    // Check if video already exists to preserve createdAt
+    const videoRef = db.ref(`users/${encodedUsername}/videos/${videoId}`);
+    const existingSnapshot = await videoRef.once('value');
+    const existingVideo = existingSnapshot.exists() ? existingSnapshot.val() : null;
+    
     // Create video data object
     const videoData = {
       youtubeUrl,
       videoId,
       title,
+      username: username, // Always store original username with video for reference
       hotcues: hotcues || {},
-      createdAt: admin.database.ServerValue.TIMESTAMP,
       updatedAt: admin.database.ServerValue.TIMESTAMP
     };
+    
+    // Only set createdAt if this is a new video
+    if (!existingVideo || !existingVideo.createdAt) {
+      videoData.createdAt = admin.database.ServerValue.TIMESTAMP;
+    } else {
+      // Preserve existing createdAt
+      videoData.createdAt = existingVideo.createdAt;
+      // Ensure username is always set, even for existing videos
+      videoData.username = username;
+    }
 
     console.log('Saving to Firebase:', {
-      path: `videos/${videoId}`,
-      data: { ...videoData, createdAt: 'SERVER_VALUE', updatedAt: 'SERVER_VALUE' }
+      path: `users/${encodedUsername}/videos/${videoId}`,
+      encodedUsername: encodedUsername,
+      originalUsername: username,
+      isNewVideo: !existingVideo,
+      data: { ...videoData, createdAt: existingVideo?.createdAt || 'SERVER_VALUE', updatedAt: 'SERVER_VALUE' }
     });
 
-    // Save to Firebase Realtime Database
-    // Using videoId as the key for easy lookup
-    const videoRef = db.ref(`videos/${videoId}`);
+    // Save to Firebase Realtime Database under user's videos
+    // Store at /users/{username}/videos/{videoId}
     
     try {
       await videoRef.set(videoData);
@@ -190,16 +244,30 @@ app.post('/videos', async (req, res) => {
   }
 });
 
-// GET /videos - Get all videos
+// GET /videos - Get videos for a specific user
 app.get('/videos', async (req, res) => {
   try {
-    console.log('GET /videos - Fetching all videos');
+    const { username } = req.query;
     
-    const videosRef = db.ref('videos');
+    if (!username) {
+      console.error('GET /videos - Missing username query parameter');
+      return res.status(400).json({ 
+        error: 'Missing required query parameter: username',
+        details: 'Username is required to fetch videos'
+      });
+    }
+
+    console.log(`GET /videos - Fetching videos for user: ${username}`);
+    
+    // Encode username for Firebase path (Firebase paths cannot contain ".", "#", "$", "[", "]")
+    const encodedUsername = encodeUsernameForFirebase(username);
+    
+    // Fetch videos for the specific user
+    const videosRef = db.ref(`users/${encodedUsername}/videos`);
     const snapshot = await videosRef.once('value');
     
     if (!snapshot.exists()) {
-      console.log('No videos found');
+      console.log(`No videos found for user: ${username} (encoded: ${encodedUsername})`);
       return res.json([]);
     }
 
@@ -210,14 +278,14 @@ app.get('/videos', async (req, res) => {
       ...videos[videoId]
     }));
 
-    // Sort by updatedAt (most recent first)
+    // Sort by createdAt (most recent first)
     videosArray.sort((a, b) => {
-      const aTime = a.updatedAt || a.createdAt || 0;
-      const bTime = b.updatedAt || b.createdAt || 0;
-      return bTime - aTime;
+      const aTime = a.createdAt || a.updatedAt || 0;
+      const bTime = b.createdAt || b.updatedAt || 0;
+      return bTime - aTime; // Most recent first (descending order)
     });
 
-    console.log(`Found ${videosArray.length} videos`);
+    console.log(`Found ${videosArray.length} videos for user: ${username}`);
     res.json(videosArray);
   } catch (error) {
     console.error('Error fetching videos:', error);
@@ -268,13 +336,27 @@ app.get('/videos/:videoId', async (req, res) => {
 app.delete('/videos/:videoId', async (req, res) => {
   try {
     const { videoId } = req.params;
-    console.log('DELETE /videos/:videoId - Request to delete videoId:', videoId);
+    const { username } = req.query;
     
-    const videoRef = db.ref(`videos/${videoId}`);
+    console.log('DELETE /videos/:videoId - Request to delete videoId:', videoId);
+    console.log('Request query:', req.query);
+
+    if (!username) {
+      console.error('DELETE /videos/:videoId - Missing username query parameter');
+      return res.status(400).json({ 
+        error: 'Missing required query parameter: username',
+        details: 'Username is required to delete videos'
+      });
+    }
+    
+    // Encode username for Firebase path (Firebase paths cannot contain ".", "#", "$", "[", "]")
+    const encodedUsername = encodeUsernameForFirebase(username);
+    
+    const videoRef = db.ref(`users/${encodedUsername}/videos/${videoId}`);
     const snapshot = await videoRef.once('value');
     
     if (!snapshot.exists()) {
-      console.log('Video not found for deletion:', videoId);
+      console.log(`Video not found for user ${username} (encoded: ${encodedUsername}) for deletion:`, videoId);
       return res.status(404).json({ 
         error: 'Video not found',
         videoId 
@@ -283,7 +365,7 @@ app.delete('/videos/:videoId', async (req, res) => {
 
     // Delete the video
     await videoRef.remove();
-    console.log('Video deleted successfully:', videoId);
+    console.log(`Video deleted successfully for user ${username} (encoded: ${encodedUsername}):`, videoId);
     
     res.json({ 
       success: true, 
@@ -299,6 +381,93 @@ app.delete('/videos/:videoId', async (req, res) => {
       details: error.message,
       type: 'FIREBASE_ERROR',
       code: error.code || 'UNKNOWN'
+    });
+  }
+});
+
+// POST /signup - Create a new user
+app.post('/signup', async (req, res) => {
+  try {
+    console.log('POST /signup - Request received');
+    console.log('Request body:', JSON.stringify(req.body, null, 2));
+    
+    const { username, password } = req.body;
+
+    // Validation
+    if (!username || !password) {
+      const missingFields = [];
+      if (!username) missingFields.push('username');
+      if (!password) missingFields.push('password');
+      
+      console.error('Validation error: Missing required fields:', missingFields);
+      return res.status(400).json({ 
+        error: 'Missing required fields',
+        missingFields: missingFields
+      });
+    }
+
+    // Validate username format (alphanumeric and underscores, 3-20 chars)
+    const usernameRegex = /^[a-zA-Z0-9_]{3,20}$/;
+    if (!usernameRegex.test(username)) {
+      return res.status(400).json({ 
+        error: 'Invalid username format',
+        details: 'Username must be 3-20 characters and contain only letters, numbers, and underscores'
+      });
+    }
+
+    // Validate password length
+    if (password.length < 6) {
+      return res.status(400).json({ 
+        error: 'Invalid password',
+        details: 'Password must be at least 6 characters long'
+      });
+    }
+
+    // Encode username for Firebase path (Firebase paths cannot contain ".", "#", "$", "[", "]")
+    const encodedUsername = encodeUsernameForFirebase(username);
+    
+    // Check if username already exists by checking the encoded path
+    const userRef = db.ref(`users/${encodedUsername}`);
+    const existingUserSnapshot = await userRef.once('value');
+    
+    if (existingUserSnapshot.exists()) {
+      console.warn(`Signup attempt with existing username: ${username} (encoded: ${encodedUsername})`);
+      return res.status(409).json({ 
+        error: 'Username already taken',
+        type: 'USERNAME_EXISTS'
+      });
+    }
+
+    // Hash the password
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+    // Create user object
+    const userData = {
+      username: username, // Store original username in the data
+      password: hashedPassword, // Store hashed password, never plain text
+      createdAt: admin.database.ServerValue.TIMESTAMP,
+      updatedAt: admin.database.ServerValue.TIMESTAMP
+    };
+
+    // Save to Firebase Realtime Database at /users/{encodedUsername}
+    await userRef.set(userData);
+
+    console.log('User created successfully:', username);
+    res.status(201).json({ 
+      success: true, 
+      message: 'User created successfully',
+      username: username
+    });
+  } catch (error) {
+    console.error('Unexpected error creating user:', error);
+    console.error('Error stack:', error.stack);
+    
+    res.status(500).json({ 
+      error: 'Internal server error',
+      details: error.message,
+      type: 'SERVER_ERROR',
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   }
 });
