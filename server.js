@@ -27,18 +27,31 @@ app.use((req, res, next) => {
 // Initialize Firebase Admin
 let db;
 try {
-  const serviceAccountPath = path.resolve(__dirname, process.env.FIREBASE_SERVICE_ACCOUNT_PATH || '../viper-js-firebase-adminsdk.json');
+  let serviceAccount;
   
-  console.log('Loading Firebase service account from:', serviceAccountPath);
-  
-  if (!fs.existsSync(serviceAccountPath)) {
-    throw new Error(`Firebase service account file not found at: ${serviceAccountPath}`);
+  // Try to load from environment variable first (for Render/deployment)
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    console.log('Loading Firebase service account from FIREBASE_SERVICE_ACCOUNT_JSON environment variable');
+    try {
+      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    } catch (parseError) {
+      throw new Error(`Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON: ${parseError.message}`);
+    }
+  } else {
+    // Fall back to file path (for local development)
+    const serviceAccountPath = path.resolve(__dirname, process.env.FIREBASE_SERVICE_ACCOUNT_PATH || '../viper-js-firebase-adminsdk.json');
+    console.log('Loading Firebase service account from file:', serviceAccountPath);
+    
+    if (!fs.existsSync(serviceAccountPath)) {
+      throw new Error(`Firebase service account file not found at: ${serviceAccountPath}. Either set FIREBASE_SERVICE_ACCOUNT_JSON environment variable or ensure the file exists.`);
+    }
+    
+    serviceAccount = require(serviceAccountPath);
   }
   
-  const serviceAccount = require(serviceAccountPath);
-  
+  // Validate service account has required fields
   if (!serviceAccount.project_id || !serviceAccount.private_key || !serviceAccount.client_email) {
-    throw new Error('Invalid Firebase service account file. Missing required fields.');
+    throw new Error('Invalid Firebase service account. Missing required fields (project_id, private_key, or client_email).');
   }
   
   const databaseURL = process.env.FIREBASE_DATABASE_URL || 'https://viper-vj-default-rtdb.europe-west1.firebasedatabase.app';
@@ -80,8 +93,12 @@ try {
   console.error('Error details:', {
     message: error.message,
     stack: error.stack,
+    hasEnvVar: !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON,
     serviceAccountPath: process.env.FIREBASE_SERVICE_ACCOUNT_PATH || '../viper-js-firebase-adminsdk.json'
   });
+  console.error('\nTo fix this:');
+  console.error('1. For deployment (Render): Set FIREBASE_SERVICE_ACCOUNT_JSON environment variable with the full JSON content');
+  console.error('2. For local development: Ensure viper-js-firebase-adminsdk.json exists in the project root');
   process.exit(1);
 }
 
