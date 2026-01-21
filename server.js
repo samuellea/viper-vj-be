@@ -2,8 +2,6 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
-const path = require('path');
-const fs = require('fs');
 const axios = require('axios');
 const bcrypt = require('bcrypt');
 
@@ -27,27 +25,39 @@ app.use((req, res, next) => {
 // Initialize Firebase Admin
 let db;
 try {
-  let serviceAccount;
+  // Load Firebase credentials from environment variables (required)
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const privateKey = process.env.FIREBASE_PRIVATE_KEY;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
   
-  // Try to load from environment variable first (for Render/deployment)
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-    console.log('Loading Firebase service account from FIREBASE_SERVICE_ACCOUNT_JSON environment variable');
-    try {
-      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-    } catch (parseError) {
-      throw new Error(`Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON: ${parseError.message}`);
-    }
-  } else {
-    // Fall back to file path (for local development)
-    const serviceAccountPath = path.resolve(__dirname, process.env.FIREBASE_SERVICE_ACCOUNT_PATH || '../viper-js-firebase-adminsdk.json');
-    console.log('Loading Firebase service account from file:', serviceAccountPath);
-    
-    if (!fs.existsSync(serviceAccountPath)) {
-      throw new Error(`Firebase service account file not found at: ${serviceAccountPath}. Either set FIREBASE_SERVICE_ACCOUNT_JSON environment variable or ensure the file exists.`);
-    }
-    
-    serviceAccount = require(serviceAccountPath);
+  // Check for required environment variables
+  const missingVars = [];
+  if (!projectId) missingVars.push('FIREBASE_PROJECT_ID');
+  if (!privateKey) missingVars.push('FIREBASE_PRIVATE_KEY');
+  if (!clientEmail) missingVars.push('FIREBASE_CLIENT_EMAIL');
+  
+  if (missingVars.length > 0) {
+    throw new Error(`Missing required Firebase environment variables: ${missingVars.join(', ')}\n\nPlease set these in your .env file (local) or Render environment variables (deployment).`);
   }
+  
+  console.log('Loading Firebase service account from environment variables');
+  console.log('Firebase Project ID:', projectId);
+  console.log('Firebase Client Email:', clientEmail);
+  
+  // Build service account object from environment variables
+  const serviceAccount = {
+    type: "service_account",
+    project_id: projectId,
+    private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID || '',
+    private_key: privateKey.replace(/\\n/g, '\n'), // Replace escaped newlines with actual newlines
+    client_email: clientEmail,
+    client_id: process.env.FIREBASE_CLIENT_ID || '',
+    auth_uri: process.env.FIREBASE_AUTH_URI || "https://accounts.google.com/o/oauth2/auth",
+    token_uri: process.env.FIREBASE_TOKEN_URI || "https://oauth2.googleapis.com/token",
+    auth_provider_x509_cert_url: process.env.FIREBASE_AUTH_PROVIDER_X509_CERT_URL || "https://www.googleapis.com/oauth2/v1/certs",
+    client_x509_cert_url: process.env.FIREBASE_CLIENT_X509_CERT_URL || '',
+    universe_domain: process.env.FIREBASE_UNIVERSE_DOMAIN || "googleapis.com"
+  };
   
   // Validate service account has required fields
   if (!serviceAccount.project_id || !serviceAccount.private_key || !serviceAccount.client_email) {
@@ -92,13 +102,20 @@ try {
   console.error('FATAL ERROR: Failed to initialize Firebase Admin:', error);
   console.error('Error details:', {
     message: error.message,
-    stack: error.stack,
-    hasEnvVar: !!process.env.FIREBASE_SERVICE_ACCOUNT_JSON,
-    serviceAccountPath: process.env.FIREBASE_SERVICE_ACCOUNT_PATH || '../viper-js-firebase-adminsdk.json'
+    stack: error.stack
   });
   console.error('\nTo fix this:');
-  console.error('1. For deployment (Render): Set FIREBASE_SERVICE_ACCOUNT_JSON environment variable with the full JSON content');
-  console.error('2. For local development: Ensure viper-js-firebase-adminsdk.json exists in the project root');
+  console.error('Set these REQUIRED environment variables:');
+  console.error('   - FIREBASE_PROJECT_ID');
+  console.error('   - FIREBASE_PRIVATE_KEY (full key with BEGIN/END lines, or with \\n for newlines)');
+  console.error('   - FIREBASE_CLIENT_EMAIL');
+  console.error('\nOptional environment variables:');
+  console.error('   - FIREBASE_PRIVATE_KEY_ID');
+  console.error('   - FIREBASE_CLIENT_ID');
+  console.error('   - FIREBASE_CLIENT_X509_CERT_URL');
+  console.error('   - FIREBASE_DATABASE_URL (defaults to viper-vj database)');
+  console.error('\nFor local development: Create a .env file in the /be directory with these variables');
+  console.error('For deployment (Render): Set these in Render dashboard > Environment Variables');
   process.exit(1);
 }
 
@@ -398,6 +415,68 @@ app.delete('/videos/:videoId', async (req, res) => {
       details: error.message,
       type: 'FIREBASE_ERROR',
       code: error.code || 'UNKNOWN'
+    });
+  }
+});
+
+// POST /login - Authenticate a user
+app.post('/login', async (req, res) => {
+  try {
+    console.log('POST /login - Request received');
+    const { username, password } = req.body;
+
+    // Validation
+    if (!username || !password) {
+      return res.status(400).json({ 
+        error: 'Missing required fields',
+        details: 'Username and password are required'
+      });
+    }
+
+    // Encode username for Firebase path
+    const encodedUsername = encodeUsernameForFirebase(username);
+    
+    // Check if user exists
+    const userRef = db.ref(`users/${encodedUsername}`);
+    const userSnapshot = await userRef.once('value');
+    
+    if (!userSnapshot.exists()) {
+      console.warn(`Login attempt with non-existent username: ${username} (encoded: ${encodedUsername})`);
+      return res.status(401).json({ 
+        error: 'No account exists for this user. Please try again!',
+        type: 'USER_NOT_FOUND'
+      });
+    }
+
+    const userData = userSnapshot.val();
+    
+    // Verify password
+    const passwordMatch = await bcrypt.compare(password, userData.password);
+    
+    if (!passwordMatch) {
+      console.warn(`Login attempt with incorrect password for username: ${username}`);
+      return res.status(401).json({ 
+        error: 'Invalid password. Please try again!',
+        type: 'INVALID_PASSWORD'
+      });
+    }
+
+    // Login successful
+    console.log('Login successful for user:', username);
+    res.json({ 
+      success: true, 
+      message: 'Login successful',
+      username: username
+    });
+  } catch (error) {
+    console.error('Unexpected error during login:', error);
+    console.error('Error stack:', error.stack);
+    
+    res.status(500).json({ 
+      error: 'Internal server error',
+      details: error.message,
+      type: 'SERVER_ERROR',
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   }
 });
